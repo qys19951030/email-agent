@@ -648,6 +648,531 @@ def test_processed_filter_edge_cases():
     print("✅ All edge case tests passed!\n")
 
 
+def test_similar_tag_not_filtered():
+    """Test that similar tags like action_processed_extra are NOT treated as processed.
+
+    This is a critical scenario: the old LIKE '%action_processed%' pattern would
+    falsely match partial tag names. Our new parsing-based approach must avoid that.
+    """
+
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
+
+    print("Testing similar tag NOT falsely filtered (new precise parsing)...")
+
+    db_path = _temp_db_path()
+    engine = None
+    try:
+        engine = create_engine(f"sqlite:///{db_path}")
+        Session = sessionmaker(bind=engine)
+
+        from email_agent.storage.models import Base, EmailORM
+
+        Base.metadata.create_all(engine)
+
+        # Session 1: Create emails with various similar-but-distinct tags
+        session1 = Session()
+
+        # Email A: has real 'action_processed' tag -> should be filtered
+        email_processed = EmailORM(
+            id="email-A-processed",
+            message_id="msg-A",
+            subject="Email A (really processed)",
+            sender_email="a@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=["action_processed", "important"],
+            connector_type="test",
+        )
+        session1.add(email_processed)
+
+        # Email B: has 'action_processed_extra' -> should NOT be filtered
+        email_similar_extra = EmailORM(
+            id="email-B-similar-extra",
+            message_id="msg-B",
+            subject="Email B (action_processed_extra)",
+            sender_email="b@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=["action_processed_extra"],
+            connector_type="test",
+        )
+        session1.add(email_similar_extra)
+
+        # Email C: has 'my_action_processed' -> should NOT be filtered
+        email_similar_prefix = EmailORM(
+            id="email-C-similar-prefix",
+            message_id="msg-C",
+            subject="Email C (my_action_processed)",
+            sender_email="c@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=["my_action_processed"],
+            connector_type="test",
+        )
+        session1.add(email_similar_prefix)
+
+        # Email D: has 'action_processed_v2' -> should NOT be filtered
+        email_similar_suffix = EmailORM(
+            id="email-D-similar-suffix",
+            message_id="msg-D",
+            subject="Email D (action_processed_v2)",
+            sender_email="d@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=["action_processed_v2"],
+            connector_type="test",
+        )
+        session1.add(email_similar_suffix)
+
+        # Email E: has tags as JSON string with similar names
+        email_json_similar = EmailORM(
+            id="email-E-json-similar",
+            message_id="msg-E",
+            subject="Email E (JSON with similar)",
+            sender_email="e@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=json.dumps(["action_processed_alt"]),
+            connector_type="test",
+        )
+        session1.add(email_json_similar)
+
+        # Email F: no tags at all -> should NOT be filtered
+        email_no_tags = EmailORM(
+            id="email-F-no-tags",
+            message_id="msg-F",
+            subject="Email F (no tags)",
+            sender_email="f@test.com",
+            date=datetime.now(),
+            received_date=datetime.now(),
+            category="primary",
+            priority="normal",
+            tags=[],
+            connector_type="test",
+        )
+        session1.add(email_no_tags)
+
+        session1.commit()
+        session1.close()
+
+        # Session 2: Simulate NEW precise filtering (not LIKE, but _parse_tags)
+        session2 = Session()
+        all_emails = (
+            session2.query(EmailORM)
+            .order_by(EmailORM.received_date.desc())
+            .all()
+        )
+
+        # Apply the SAME filtering logic as in smart_actions CLI
+        skip_processed = True
+        if skip_processed:
+            after_filter = [
+                e for e in all_emails
+                if "action_processed" not in _parse_tags(e.tags)
+            ]
+        else:
+            after_filter = all_emails
+
+        filtered_ids = [e.id for e in after_filter]
+
+        # Email A (real processed) should be FILTERED OUT
+        assert "email-A-processed" not in filtered_ids, \
+            "Real 'action_processed' should be filtered"
+        print("  ✅ Real 'action_processed' tag is correctly filtered out")
+
+        # All similar tags should remain (NOT filtered)
+        assert "email-B-similar-extra" in filtered_ids, \
+            "'action_processed_extra' should NOT be filtered"
+        print("  ✅ 'action_processed_extra' is NOT falsely filtered")
+
+        assert "email-C-similar-prefix" in filtered_ids, \
+            "'my_action_processed' should NOT be filtered"
+        print("  ✅ 'my_action_processed' is NOT falsely filtered")
+
+        assert "email-D-similar-suffix" in filtered_ids, \
+            "'action_processed_v2' should NOT be filtered"
+        print("  ✅ 'action_processed_v2' is NOT falsely filtered")
+
+        assert "email-E-json-similar" in filtered_ids, \
+            "JSON 'action_processed_alt' should NOT be filtered"
+        print("  ✅ JSON with 'action_processed_alt' is NOT falsely filtered")
+
+        assert "email-F-no-tags" in filtered_ids, \
+            "No tags email should NOT be filtered"
+        print("  ✅ Email with no tags is NOT filtered")
+
+        # Also verify the OLD LIKE pattern would have failed
+        old_like_filtered = [
+            e for e in all_emails
+            if not (e.tags and "action_processed" in str(e.tags))
+        ]
+        old_filtered_ids = [e.id for e in old_like_filtered]
+
+        # Old LIKE pattern would falsely filter out B, C, D, E - prove this
+        falsely_removed_by_old = [
+            i for i in filtered_ids if i not in old_filtered_ids
+        ]
+        # The new approach preserves items that the old approach would have lost
+        # At minimum B should be in this list
+        assert len(falsely_removed_by_old) >= 1
+        print(f"  ✅ Old LIKE pattern would have falsely removed {len(falsely_removed_by_old)} emails which new approach correctly preserves")
+
+        session2.close()
+
+        print("✅ All similar tag precision tests passed!\n")
+
+    finally:
+        if engine:
+            engine.dispose()
+        try:
+            if os.path.exists(db_path):
+                os.unlink(db_path)
+        except Exception:
+            pass
+
+
+def test_commitment_tracker_idempotency():
+    """Test that calling track_commitments_from_actions multiple times for the same
+    email with the same actions does NOT create duplicate records.
+
+    Covers requirement #2: non-dry-run + --all reprocessing should not duplicate.
+    """
+
+    import asyncio
+    import sqlite3
+    import importlib.util
+    import uuid
+
+    print("Testing commitment tracker idempotency (no duplicates on re-run)...")
+
+    # Use a manually managed temp dir (bypass Windows file lock cleanup issues)
+    tmp_dir = os.path.join(tempfile.gettempdir(), f"ct_idem_{uuid.uuid4().hex}")
+    os.makedirs(tmp_dir, exist_ok=True)
+    tmp_path = Path(tmp_dir)
+
+    # Create an empty commitments database with our expected schema.
+    tracker_db_path = tmp_path / "commitments.db"
+
+    with sqlite3.connect(tracker_db_path) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS commitments (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id TEXT,
+                commitment_type TEXT,
+                description TEXT,
+                committed_to TEXT,
+                committed_by TEXT,
+                deadline DATE,
+                priority TEXT,
+                status TEXT,
+                created_at DATETIME,
+                updated_at DATETIME,
+                completion_date DATETIME,
+                reminder_sent BOOLEAN DEFAULT FALSE,
+                context_data TEXT
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS follow_ups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                commitment_id INTEGER,
+                follow_up_type TEXT,
+                follow_up_date DATE,
+                status TEXT,
+                notes TEXT,
+                created_at DATETIME,
+                FOREIGN KEY (commitment_id) REFERENCES commitments (id)
+            )
+            """
+        )
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS waiting_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email_id TEXT,
+                description TEXT,
+                waiting_from TEXT,
+                expected_date DATE,
+                priority TEXT,
+                status TEXT,
+                created_at DATETIME,
+                updated_at DATETIME,
+                received_date DATETIME,
+                context_data TEXT
+            )
+            """
+        )
+        conn.commit()
+
+    sys.path.insert(0, SRC_DIR)
+    from email_agent.models import Email, EmailAddress, EmailCategory, EmailPriority
+
+    # Import commitment_tracker DIRECTLY via its file path, bypassing
+    # agents/__init__.py which imports crewai.
+    # Since commitment_tracker uses `from ..config import settings`, we
+    # need to properly set up the module with a parent package context.
+    import email_agent.config as config_module
+    import email_agent  # noqa - ensure email_agent package is loaded
+    if "email_agent.config" not in sys.modules:
+        sys.modules["email_agent.config"] = config_module
+
+    # Load the module as a proper sub-package of email_agent.agents
+    # Step 1: create or reuse a pseudo 'email_agent.agents' module in sys.modules
+    if "email_agent.agents" not in sys.modules:
+        agents_pkg = importlib.util.module_from_spec(
+            importlib.util.spec_from_loader("email_agent.agents", loader=None)
+        )
+        agents_pkg.__path__ = [
+            os.path.join(SRC_DIR, "email_agent", "agents")
+        ]
+        sys.modules["email_agent.agents"] = agents_pkg
+    else:
+        agents_pkg = sys.modules["email_agent.agents"]
+
+    # Step 2: register parent reference so relative import resolves
+    # Make sure email_agent has reference to agents submodule
+    if not hasattr(email_agent, "agents"):
+        email_agent.agents = agents_pkg
+
+    # Step 3: load commitment_tracker via file spec
+    ct_spec = importlib.util.spec_from_file_location(
+        "email_agent.agents.commitment_tracker",
+        os.path.join(SRC_DIR, "email_agent", "agents", "commitment_tracker.py")
+    )
+    ct_module = importlib.util.module_from_spec(ct_spec)
+    # Register BEFORE exec_module so intra-module references work
+    sys.modules["email_agent.agents.commitment_tracker"] = ct_module
+    agents_pkg.commitment_tracker = ct_module
+
+    try:
+        ct_spec.loader.exec_module(ct_module)
+    except Exception as load_err:
+        raise AssertionError(
+            f"Failed to load commitment_tracker module: {load_err}"
+        ) from load_err
+
+    CommitmentTrackerAgent = ct_module.CommitmentTrackerAgent
+
+    # Now instantiate - but __init__ reads settings.data_dir!
+    # We cannot easily patch settings because pydantic Settings are frozen.
+    # Strategy: build an instance via __new__ then manually call init
+    # and override tracker_db_path before any real use.
+    tracker = CommitmentTrackerAgent.__new__(CommitmentTrackerAgent)
+    # Initialize the attributes that __init__ sets up
+    try:
+        from openai import AsyncOpenAI
+    except ImportError:
+        raise AssertionError(
+            "Need openai package installed for CommitmentTrackerAgent"
+        )
+    tracker.client = AsyncOpenAI(api_key=config_module.settings.openai_api_key or "dummy")
+    tracker.model = config_module.settings.openai_model or "gpt-4"
+    tracker.tracker_db_path = tracker_db_path
+    # Re-init tables (already created, so this is a no-op CREATE IF NOT EXISTS)
+    tracker._init_tracker_db()
+
+    # Confirm it's using the temp DB
+    assert str(tracker.tracker_db_path) == str(tracker_db_path), \
+        f"Expected {tracker_db_path}, got {tracker.tracker_db_path}"
+    print(f"  ✅ Tracker using temp DB: {tracker.tracker_db_path.name}")
+
+    # Create test email
+    email = Email(
+        id="email-idemp-test-1",
+        message_id="msg-idemp-test",
+        subject="Idempotency test email",
+        sender=EmailAddress(email="user@company.com", name="Test User"),
+        recipients=[EmailAddress(email="manager@company.com", name="Manager")],
+        date=datetime.now(),
+        received_date=datetime.now(),
+        category=EmailCategory.PRIMARY,
+        priority=EmailPriority.NORMAL,
+    )
+
+    # Define actions: 1 commitment + 1 waiting item
+    action_result = {
+        "action_items": [],
+        "commitments_made": [
+            {
+                "commitment": "Send the quarterly report",
+                "deadline": "2026-06-27",
+                "recipient": "manager@company.com",
+            }
+        ],
+        "waiting_for": [
+            {
+                "waiting_for": "Budget approval",
+                "from_whom": "finance@company.com",
+                "deadline": "2026-06-30",
+            }
+        ],
+        "meeting_requests": [],
+        "needs_response": False,
+        "summary": "Idempotency test email.",
+    }
+
+    # ---- ROUND 1: First call ----
+    result_round1 = asyncio.run(
+        tracker.track_commitments_from_actions(email, action_result)
+    )
+
+    assert len(result_round1) == 2, \
+        f"Round 1: expected 2 items, got {len(result_round1)}"
+    new_items_r1 = [i for i in result_round1 if not i.get("existing", False)]
+    assert len(new_items_r1) == 2, \
+        f"Round 1: expected 2 NEW items, got {len(new_items_r1)}"
+
+    r1_commitment_id = next(
+        i["id"] for i in result_round1 if i["type"] == "commitment"
+    )
+    r1_waiting_id = next(
+        i["id"] for i in result_round1 if i["type"] == "waiting"
+    )
+    print(f"  ✅ Round 1: inserted 2 new items "
+          f"(commitment={r1_commitment_id}, waiting={r1_waiting_id})")
+
+    # Verify stats after round 1
+    stats_r1 = asyncio.run(tracker.get_commitment_stats())
+    assert stats_r1["total_commitments"] == 1
+    assert stats_r1["total_waiting_items"] == 1
+    print("  ✅ Round 1 stats: 1 commitment + 1 waiting in DB")
+
+    # ---- ROUND 2: Same email, same actions (simulates --all re-run) ----
+    result_round2 = asyncio.run(
+        tracker.track_commitments_from_actions(email, action_result)
+    )
+
+    assert len(result_round2) == 2, \
+        f"Round 2: expected 2 items, got {len(result_round2)}"
+
+    existing_r2 = [i for i in result_round2 if i.get("existing", False)]
+    new_r2 = [i for i in result_round2 if not i.get("existing", False)]
+    assert len(existing_r2) == 2, \
+        f"Round 2: both items should be existing, got new={new_r2}"
+    assert len(new_r2) == 0, \
+        f"Round 2: NO new items expected, got {len(new_r2)}"
+
+    r2_commitment_id = next(
+        i["id"] for i in result_round2 if i["type"] == "commitment"
+    )
+    r2_waiting_id = next(
+        i["id"] for i in result_round2 if i["type"] == "waiting"
+    )
+
+    # Critical: IDs must match round 1
+    assert r2_commitment_id == r1_commitment_id, \
+        "Round 2 commitment ID changed! Duplicate was inserted."
+    assert r2_waiting_id == r1_waiting_id, \
+        "Round 2 waiting ID changed! Duplicate was inserted."
+
+    print(f"  ✅ Round 2 (--all re-run): returned same 2 existing items, "
+          f"0 duplicates inserted, IDs preserved")
+
+    # Stats should NOT have changed
+    stats_r2 = asyncio.run(tracker.get_commitment_stats())
+    assert stats_r2["total_commitments"] == 1, \
+        f"Commitments duplicated! Now {stats_r2['total_commitments']}"
+    assert stats_r2["total_waiting_items"] == 1, \
+        f"Waiting duplicated! Now {stats_r2['total_waiting_items']}"
+    print("  ✅ Round 2 stats: still 1 commitment + 1 waiting (NO growth)")
+
+    # ---- ROUND 3: Add a genuinely NEW commitment to the same email ----
+    action_result_v2 = {
+        **action_result,
+        "commitments_made": [
+            {
+                "commitment": "Send the quarterly report",
+                "deadline": "2026-06-27",
+                "recipient": "manager@company.com",
+            },
+            {
+                "commitment": "Prepare the team offsite plan",
+                "deadline": "2026-07-15",
+                "recipient": "hr@company.com",
+            },
+        ],
+        "waiting_for": [
+            {
+                "waiting_for": "Budget approval",
+                "from_whom": "finance@company.com",
+                "deadline": "2026-06-30",
+            }
+        ],
+    }
+
+    result_round3 = asyncio.run(
+        tracker.track_commitments_from_actions(email, action_result_v2)
+    )
+
+    # Should be 3 total: 2 existing + 1 new commitment
+    assert len(result_round3) == 3, \
+        f"Round 3: expected 3 items, got {len(result_round3)}"
+
+    existing_r3 = [i for i in result_round3 if i.get("existing", False)]
+    new_r3 = [i for i in result_round3 if not i.get("existing", False)]
+    assert len(existing_r3) == 2, \
+        f"Round 3: 2 should be existing, got {len(existing_r3)}"
+    assert len(new_r3) == 1, \
+        f"Round 3: 1 should be new, got {len(new_r3)}"
+
+    # Original IDs still present
+    r3_ids = [i["id"] for i in result_round3]
+    assert r1_commitment_id in r3_ids
+    assert r1_waiting_id in r3_ids
+
+    print(f"  ✅ Round 3 (genuinely new item): "
+          f"{len(existing_r3)} existing + {len(new_r3)} new = 3 total, "
+          f"original IDs preserved")
+
+    # Stats: now 2 commitments, still 1 waiting
+    stats_r3 = asyncio.run(tracker.get_commitment_stats())
+    assert stats_r3["total_commitments"] == 2, \
+        f"Expected 2 commitments, got {stats_r3['total_commitments']}"
+    assert stats_r3["total_waiting_items"] == 1, \
+        f"Still expected 1 waiting, got {stats_r3['total_waiting_items']}"
+    print("  ✅ Round 3 stats: 2 commitments + 1 waiting "
+          "(genuine new data is tracked correctly)")
+
+    # ---- ROUND 4: Same as round 3 (verify idempotency again) ----
+    result_round4 = asyncio.run(
+        tracker.track_commitments_from_actions(email, action_result_v2)
+    )
+    all_existing_r4 = all(
+        i.get("existing", False) for i in result_round4
+    )
+    assert all_existing_r4, "Round 4: ALL items should be existing"
+    assert len(result_round4) == 3
+
+    stats_r4 = asyncio.run(tracker.get_commitment_stats())
+    assert stats_r4["total_commitments"] == 2
+    assert stats_r4["total_waiting_items"] == 1
+    print("  ✅ Round 4 (re-run round3): all 3 existing, no duplicates")
+
+    # Cleanup: best effort (Windows file lock OK if it fails)
+    import shutil
+    try:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+    except Exception:
+        pass
+
+    print("✅ All commitment tracker idempotency tests passed!\n")
+
+
 def main():
     """Run all standalone tests."""
     print("=" * 60)
@@ -663,6 +1188,8 @@ def main():
         ("Data persistence", test_data_persistence_fields),
         ("Behavior logic", test_smart_actions_behavior_logic),
         ("Processed filter edge cases", test_processed_filter_edge_cases),
+        ("Similar tag precision (NEW)", test_similar_tag_not_filtered),
+        ("Commitment tracker idempotency (NEW)", test_commitment_tracker_idempotency),
         ("Action extractor structure", test_action_extractor_structure),
         ("Commitment tracker structure", test_commitment_tracker_structure),
         ("Smart actions CLI structure", test_smart_actions_cli_structure),

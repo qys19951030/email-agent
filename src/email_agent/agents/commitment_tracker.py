@@ -95,7 +95,12 @@ class CommitmentTrackerAgent:
     async def track_commitments_from_actions(
         self, email: Email, actions: Dict[str, Any]
     ) -> List[Dict[str, Any]]:
-        """Track commitments extracted from email actions."""
+        """Track commitments extracted from email actions.
+
+        Idempotent: calling this multiple times with the same email and actions
+        will not create duplicate records. Existing records are returned
+        without modification, genuinely new items are inserted.
+        """
 
         tracked_commitments = []
 
@@ -105,6 +110,52 @@ class CommitmentTrackerAgent:
 
                 # Process commitments made
                 for commitment in actions.get("commitments_made", []):
+                    desc = commitment["commitment"]
+                    recipient = commitment.get("recipient")
+                    deadline = commitment.get("deadline")
+
+                    # Idempotency check: look for existing matching record
+                    # Match by email_id + description + recipient + deadline
+                    # (deadline is part of the unique key to allow the same
+                    # commitment with a revised deadline to be tracked separately)
+                    cursor.execute(
+                        """
+                        SELECT id, description, deadline, status
+                        FROM commitments
+                        WHERE email_id = ?
+                          AND description = ?
+                          AND COALESCE(committed_to, '') = COALESCE(?, '')
+                          AND COALESCE(deadline, '') = COALESCE(?, '')
+                          AND commitment_type = ?
+                        LIMIT 1
+                        """,
+                        (
+                            email.id,
+                            desc,
+                            recipient,
+                            deadline,
+                            "outgoing",
+                        ),
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        # Record already exists: return without modifying
+                        commitment_id = existing[0]
+                        status = existing[3]
+                        tracked_commitments.append(
+                            {
+                                "id": commitment_id,
+                                "type": "commitment",
+                                "description": desc,
+                                "deadline": deadline,
+                                "status": status,
+                                "existing": True,
+                            }
+                        )
+                        continue
+
+                    # New commitment: insert it
                     cursor.execute(
                         """
                         INSERT INTO commitments (
@@ -116,11 +167,11 @@ class CommitmentTrackerAgent:
                         (
                             email.id,
                             "outgoing",
-                            commitment["commitment"],
-                            commitment.get("recipient"),
+                            desc,
+                            recipient,
                             email.sender.email,
-                            commitment.get("deadline"),
-                            "medium",  # Default priority
+                            deadline,
+                            "medium",
                             "pending",
                             datetime.now().isoformat(),
                             datetime.now().isoformat(),
@@ -139,14 +190,55 @@ class CommitmentTrackerAgent:
                         {
                             "id": commitment_id,
                             "type": "commitment",
-                            "description": commitment["commitment"],
-                            "deadline": commitment.get("deadline"),
+                            "description": desc,
+                            "deadline": deadline,
                             "status": "pending",
+                            "existing": False,
                         }
                     )
 
                 # Process waiting items
                 for waiting in actions.get("waiting_for", []):
+                    desc = waiting["waiting_for"]
+                    from_whom = waiting.get("from_whom")
+                    deadline = waiting.get("deadline")
+
+                    # Idempotency check for waiting items
+                    cursor.execute(
+                        """
+                        SELECT id, description, expected_date, status
+                        FROM waiting_items
+                        WHERE email_id = ?
+                          AND description = ?
+                          AND COALESCE(waiting_from, '') = COALESCE(?, '')
+                          AND COALESCE(expected_date, '') = COALESCE(?, '')
+                        LIMIT 1
+                        """,
+                        (
+                            email.id,
+                            desc,
+                            from_whom,
+                            deadline,
+                        ),
+                    )
+                    existing = cursor.fetchone()
+
+                    if existing:
+                        waiting_id = existing[0]
+                        status = existing[3]
+                        tracked_commitments.append(
+                            {
+                                "id": waiting_id,
+                                "type": "waiting",
+                                "description": desc,
+                                "expected_date": deadline,
+                                "status": status,
+                                "existing": True,
+                            }
+                        )
+                        continue
+
+                    # New waiting item: insert it
                     cursor.execute(
                         """
                         INSERT INTO waiting_items (
@@ -156,9 +248,9 @@ class CommitmentTrackerAgent:
                     """,
                         (
                             email.id,
-                            waiting["waiting_for"],
-                            waiting.get("from_whom"),
-                            waiting.get("deadline"),
+                            desc,
+                            from_whom,
+                            deadline,
                             "medium",
                             "waiting",
                             datetime.now().isoformat(),
@@ -178,9 +270,10 @@ class CommitmentTrackerAgent:
                         {
                             "id": waiting_id,
                             "type": "waiting",
-                            "description": waiting["waiting_for"],
-                            "expected_date": waiting.get("deadline"),
+                            "description": desc,
+                            "expected_date": deadline,
                             "status": "waiting",
+                            "existing": False,
                         }
                     )
 

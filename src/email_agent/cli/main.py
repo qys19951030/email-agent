@@ -518,19 +518,29 @@ def smart_actions(
         with db.get_session() as session:
             from ..storage.models import EmailORM
 
-            query = session.query(EmailORM)
-
-            if skip_processed:
-                query = query.filter(
-                    ~EmailORM.tags.like("%action_processed%")
-                )
-
-            recent_emails = (
-                query
+            # Query all recent emails first, then apply precise tag filtering
+            # in Python to avoid LIKE substring matching false positives
+            # (e.g. "action_processed_extra" shouldn't match "action_processed")
+            all_recent = (
+                session.query(EmailORM)
                 .order_by(EmailORM.received_date.desc())
-                .limit(limit)
+                .limit(
+                    limit * 5 if skip_processed else limit
+                )  # Fetch extra if we'll filter out processed
                 .all()
             )
+
+            # Apply precise processed filtering using real tag parsing
+            if skip_processed:
+                recent_emails = [
+                    e
+                    for e in all_recent
+                    if "action_processed" not in _parse_tags(e.tags)
+                ]
+                # Trim to requested limit after filtering
+                recent_emails = recent_emails[:limit]
+            else:
+                recent_emails = all_recent[:limit]
 
             console.print(
                 f"Found [yellow]{len(recent_emails)}[/yellow] emails to analyze for actions"
