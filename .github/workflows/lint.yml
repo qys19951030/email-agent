@@ -1,0 +1,41 @@
+name: Lint
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Set up Python
+      uses: actions/setup-python@v6
+      with:
+        python-version: '3.11'
+    
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -e .
+        pip install ruff black isort mypy
+    
+    - name: Run ruff
+      run: |
+        ruff check src/email_agent/
+    
+    - name: Check formatting with black
+      run: |
+        black --check src/email_agent/
+    
+    - name: Check import ordering with isort
+      run: |
+        isort --check-only src/email_agent/
+    
+    - name: Run mypy
+      run: |
+        mypy src/email_agent/ --ignore-missing-imports || true
