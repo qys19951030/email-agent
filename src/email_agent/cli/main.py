@@ -269,6 +269,46 @@ def parse_time_string(time_str: str) -> datetime:
     return datetime.now() - timedelta(days=1)
 
 
+def _parse_tags(tags_value) -> list:
+    """Safely parse tags from either a list or JSON string.
+
+    Returns a list of tag strings.
+    """
+    if not tags_value:
+        return []
+    if isinstance(tags_value, list):
+        return tags_value
+    if isinstance(tags_value, str):
+        try:
+            parsed = json.loads(tags_value)
+            if isinstance(parsed, list):
+                return parsed
+        except (json.JSONDecodeError, TypeError):
+            return [tags_value]
+    return []
+
+
+def _add_tag(tags_value, tag: str) -> list:
+    """Add a tag to tags, avoiding duplicates.
+
+    Handles both list and JSON string inputs.
+    Returns a NEW list (safe for SQLAlchemy JSON change detection).
+    """
+    current_tags = _parse_tags(tags_value)
+    if tag not in current_tags:
+        return current_tags + [tag]
+    return list(current_tags)
+
+
+def _serialize_tags(tags_list: list) -> str:
+    """Serialize tags list to JSON string for storage.
+
+    Note: SQLAlchemy JSON columns auto-serialize, but some code paths
+    manually stringify. This helper provides consistent serialization.
+    """
+    return json.dumps(tags_list)
+
+
 @app.command()
 def smart_inbox(
     limit: int = typer.Option(50, help="Maximum number of emails to process"),
@@ -464,21 +504,29 @@ def smart_actions(
 
     async def run_smart_actions():
         from ..agents.action_extractor import ActionExtractorAgent
+        from ..agents.commitment_tracker import CommitmentTrackerAgent
         from ..connectors.gmail_service import GmailService
         from ..models import Email, EmailAddress, EmailPriority
 
         db = DatabaseManager()
         action_extractor = ActionExtractorAgent()
+        commitment_tracker = CommitmentTrackerAgent()
 
         console.print("[bold cyan]🔍 Smart Action Extraction Starting...[/bold cyan]")
 
-        # Get recent unprocessed emails
+        # Get recent emails (filtered by skip_processed flag)
         with db.get_session() as session:
             from ..storage.models import EmailORM
 
+            query = session.query(EmailORM)
+
+            if skip_processed:
+                query = query.filter(
+                    ~EmailORM.tags.like("%action_processed%")
+                )
+
             recent_emails = (
-                session.query(EmailORM)
-                .filter(~EmailORM.tags.like("%action_processed%"))
+                query
                 .order_by(EmailORM.received_date.desc())
                 .limit(limit)
                 .all()
@@ -504,7 +552,7 @@ def smart_actions(
                     recipients=[],
                     date=e.date,
                     received_date=e.received_date,
-                    body=e.body_text or "",
+                    body_text=e.body_text or "",
                     is_read=e.is_read,
                     is_flagged=e.is_flagged,
                     category=(
@@ -517,7 +565,7 @@ def smart_actions(
                         if e.priority
                         else EmailPriority.NORMAL
                     ),
-                    tags=e.tags or [],
+                    tags=_parse_tags(e.tags),
                 )
                 emails.append(email)
 
@@ -528,7 +576,6 @@ def smart_actions(
         # Initialize Gmail service if credentials available
         gmail_service = None
         try:
-            # Check for Gmail credentials
             import os
 
             if os.path.exists("credentials.json"):
@@ -549,17 +596,23 @@ def smart_actions(
         total_commitments = 0
         total_meetings = 0
         total_deadlines = 0
+        processed_count = 0
+        error_count = 0
 
         for i, (email, actions) in enumerate(zip(emails, actions_results)):
             if "error" in actions:
                 console.print(
                     f"[red]❌ Error processing {email.subject[:40]}...: {actions['error']}[/red]"
                 )
+                error_count += 1
                 continue
+
+            processed_count += 1
 
             # Count actions
             actions_count = len(actions.get("action_items", []))
             commitments_count = len(actions.get("commitments_made", []))
+            waiting_count = len(actions.get("waiting_for", []))
             meetings_count = len(actions.get("meeting_requests", []))
             deadlines_count = sum(
                 1 for item in actions.get("action_items", []) if item.get("deadline")
@@ -570,11 +623,29 @@ def smart_actions(
             total_meetings += meetings_count
             total_deadlines += deadlines_count
 
-            if actions_count > 0 or commitments_count > 0 or meetings_count > 0:
+            has_items = (
+                actions_count > 0
+                or commitments_count > 0
+                or waiting_count > 0
+                or meetings_count > 0
+            )
+
+            # Show output if has items or --show-all is enabled
+            if has_items or show_all:
                 console.print(f"\n📧 [bold]{email.subject[:50]}...[/bold]")
                 console.print(f"   From: {email.sender.email}")
 
-                if actions.get("needs_response"):
+                # Always show summary and response status with --show-all
+                if show_all:
+                    summary_text = actions.get("summary", "No summary available")
+                    console.print(f"   📝 Summary: {summary_text[:80]}...")
+
+                    needs_resp = actions.get("needs_response", False)
+                    resp_color = "yellow" if needs_resp else "dim"
+                    resp_text = "Yes" if needs_resp else "No"
+                    console.print(f"   📢 Needs reply: [{resp_color}]{resp_text}[/{resp_color}]")
+
+                if actions.get("needs_response") and has_items:
                     urgency = actions.get("response_urgency", "normal")
                     urgency_color = (
                         "red"
@@ -582,7 +653,7 @@ def smart_actions(
                         else "yellow" if urgency == "normal" else "green"
                     )
                     console.print(
-                        f"   📢 Needs response: [{urgency_color}]{urgency}[/{urgency_color}]"
+                        f"   ⚡ Response urgency: [{urgency_color}]{urgency}[/{urgency_color}]"
                     )
 
                 if actions_count > 0:
@@ -598,9 +669,14 @@ def smart_actions(
                         )
 
                 if commitments_count > 0:
-                    console.print(f"   🤝 Commitments: {commitments_count}")
+                    console.print(f"   🤝 Commitments made: {commitments_count}")
                     for commitment in actions.get("commitments_made", [])[:2]:
                         console.print(f"     • {commitment['commitment'][:60]}...")
+
+                if waiting_count > 0:
+                    console.print(f"   ⏳ Waiting for: {waiting_count}")
+                    for waiting in actions.get("waiting_for", [])[:2]:
+                        console.print(f"     • {waiting['waiting_for'][:60]}...")
 
                 if meetings_count > 0:
                     console.print(f"   📅 Meetings: {meetings_count}")
@@ -636,22 +712,52 @@ def smart_actions(
                     except Exception as e:
                         console.print(f"     [red]❌ Gmail feature error: {e}[/red]")
 
-                # Mark as processed in database
-                if not dry_run:
-                    with db.get_session() as session:
-                        email_orm = (
-                            session.query(EmailORM).filter_by(id=email.id).first()
+                # Track commitments and waiting items if not dry run
+                if not dry_run and (commitments_count > 0 or waiting_count > 0):
+                    try:
+                        tracked = await commitment_tracker.track_commitments_from_actions(
+                            email, actions
                         )
-                        if email_orm:
-                            current_tags = email_orm.tags or []
-                            if isinstance(current_tags, str):
-                                current_tags = json.loads(current_tags)
-                            current_tags.append("action_processed")
-                            email_orm.tags = json.dumps(current_tags)
-                            session.commit()
+                        if tracked:
+                            console.print(
+                                f"     📊 Tracked {len(tracked)} items in commitment database"
+                            )
+                    except Exception as e:
+                        console.print(
+                            f"     [yellow]⚠️  Commitment tracking error: {e}[/yellow]"
+                        )
+
+            # Mark as processed and persist results in database (non-dry-run only)
+            if not dry_run:
+                with db.get_session() as session:
+                    email_orm = (
+                        session.query(EmailORM).filter_by(id=email.id).first()
+                    )
+                    if email_orm:
+                        # Update tags with action_processed (avoid duplicates)
+                        updated_tags = _add_tag(email_orm.tags, "action_processed")
+                        email_orm.tags = updated_tags
+
+                        # Persist extraction results
+                        email_orm.summary = actions.get("summary")
+
+                        # Persist action items as list of strings
+                        action_items_list = [
+                            item.get("action", "")
+                            for item in actions.get("action_items", [])
+                        ]
+                        email_orm.action_items = action_items_list
+
+                        # Update processed timestamp
+                        email_orm.processed_at = datetime.now()
+
+                        session.commit()
 
         # Show summary
         console.print("\n📊 [bold]Action Extraction Summary:[/bold]")
+        console.print(f"  📧 Emails processed: [cyan]{processed_count}[/cyan]")
+        if error_count > 0:
+            console.print(f"  ❌ Errors: [red]{error_count}[/red]")
         console.print(f"  📋 Total action items: [cyan]{total_actions}[/cyan]")
         console.print(f"  🤝 Total commitments: [cyan]{total_commitments}[/cyan]")
         console.print(f"  📅 Meeting requests: [cyan]{total_meetings}[/cyan]")
@@ -661,18 +767,19 @@ def smart_actions(
             console.print("\n[yellow]DRY RUN - No changes were made[/yellow]")
         else:
             console.print(
-                f"\n[green]✅ Processed {len(emails)} emails for actions[/green]"
+                f"\n[green]✅ Processed {processed_count} emails for actions[/green]"
             )
 
         # Generate action summary
-        summary = await action_extractor.generate_action_summary(actions_results)
+        valid_results = [r for r in actions_results if "error" not in r]
+        summary = await action_extractor.generate_action_summary(valid_results)
 
-        if summary["deadlines_today"] > 0:
+        if summary.get("deadlines_today", 0) > 0:
             console.print(
                 f"\n[red]⚠️  {summary['deadlines_today']} items due TODAY![/red]"
             )
 
-        if summary["deadlines_this_week"] > 0:
+        if summary.get("deadlines_this_week", 0) > 0:
             console.print(
                 f"[yellow]📅 {summary['deadlines_this_week']} items due this week[/yellow]"
             )
